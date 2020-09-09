@@ -58,7 +58,6 @@
 #include "vectors.h"
 
 #define CHACHA_BLOCK_SIZE    64
-#define CHACHA_NB_BLOCKS     10
 #define POLY1305_BLOCK_SIZE  16
 #define BLAKE2B_BLOCK_SIZE  128
 #define SHA_512_BLOCK_SIZE  128
@@ -88,7 +87,7 @@ static void ietf_chacha20(const vector in[], vector *out)
     u32 ctr       = load32_le(in[3].buf);
     u32 new_ctr   = crypto_ietf_chacha20_ctr(out->buf, plain->buf, plain->size,
                                              key->buf, nonce->buf, ctr);
-    u32 nb_blocks = plain->size / 64 + (plain->size % 64 != 0);
+    u32 nb_blocks = (u32)(plain->size / 64 + (plain->size % 64 != 0));
     if (new_ctr - ctr != nb_blocks) {
         printf("FAILURE: IETF Chacha20 returned counter not correct: ");
     }
@@ -243,8 +242,8 @@ static void ed_25519_check(const vector in[], vector *out)
     const vector *public_k = in;
     const vector *msg      = in + 1;
     const vector *sig      = in + 2;
-    out->buf[0] = crypto_ed25519_check(sig->buf, public_k->buf,
-                                       msg->buf, msg->size);
+    out->buf[0] = (u8)crypto_ed25519_check(sig->buf, public_k->buf,
+                                           msg->buf, msg->size);
 }
 
 static void iterate_x25519(u8 k[32], u8 u[32])
@@ -331,7 +330,7 @@ static int p_verify(size_t size, int (*compare)(const u8*, const u8*))
                 }
                 a[k] = (u8)i; a[k + size/2 - 1] = (u8)i;
                 b[k] = (u8)j; b[k + size/2 - 1] = (u8)j;
-                int cmp = compare(a, b);
+                cmp = compare(a, b);
                 status |= (i == j ? cmp : ~cmp);
             }
         }
@@ -653,16 +652,17 @@ static int p_argon2i_overlap()
     u8 *clean_work_area = (u8*)alloc(8 * 1024);
     FOR (i, 0, 10) {
         p_random(work_area, 8 * 1024);
+        u32 hash_offset = rand64() % 64;
         u32 pass_offset = rand64() % 64;
         u32 salt_offset = rand64() % 64;
         u32 key_offset  = rand64() % 64;
         u32 ad_offset   = rand64() % 64;
-        u8 hash1[32];
-        u8 hash2[32];
-        u8 pass [16];  FOR (i, 0, 16) { pass[i] = work_area[i + pass_offset]; }
-        u8 salt [16];  FOR (i, 0, 16) { salt[i] = work_area[i + salt_offset]; }
-        u8 key  [32];  FOR (i, 0, 32) { key [i] = work_area[i +  key_offset]; }
-        u8 ad   [32];  FOR (i, 0, 32) { ad  [i] = work_area[i +   ad_offset]; }
+        u8  hash1[32];
+        u8 *hash2 = work_area + hash_offset;
+        u8  pass [16];  FOR (j, 0, 16) { pass[j] = work_area[j + pass_offset]; }
+        u8  salt [16];  FOR (j, 0, 16) { salt[j] = work_area[j + salt_offset]; }
+        u8  key  [32];  FOR (j, 0, 32) { key [j] = work_area[j +  key_offset]; }
+        u8  ad   [32];  FOR (j, 0, 32) { ad  [j] = work_area[j +   ad_offset]; }
 
         crypto_argon2i_general(hash1, 32, clean_work_area, 8, 1,
                                pass, 16, salt, 16, key, 32, ad, 32);
@@ -947,7 +947,7 @@ static int p_elligator_x25519()
 
         // Maximise tweak diversity.
         // We want to set the bits 1 (sign) and 6-7 (padding)
-        u8 tweak = (i & 1) + (i << 6);
+        u8 tweak = (u8)((i & 1) + (i << 6));
         u8 r[32];
         if (crypto_curve_to_hidden(r, pkf, tweak)) {
             continue; // retry untill success (doesn't increment the tweak)
@@ -1010,13 +1010,15 @@ static int p_elligator_key_pair_overlap()
 static int p_x25519_inverse()
 {
     int status = 0;
-    const u8 base [32] = {9};
+    RANDOM_INPUT(b, 32);
+    u8 base[32];  // random point (cofactor is cleared).
+    crypto_x25519_public_key(base, b);
     // check round trip
     FOR (i, 0, 50) {
         RANDOM_INPUT(sk, 32);
         u8 pk   [32];
         u8 blind[32];
-        crypto_x25519_public_key(pk, sk);
+        crypto_x25519(pk, sk, base);
         crypto_x25519_inverse(blind, sk, pk);
         status |= memcmp(blind, base, 32);
     }
@@ -1063,7 +1065,7 @@ static int p_x25519_inverse_overlap()
     return status;
 }
 
-int p_from_eddsa()
+static int p_from_eddsa()
 {
     int status = 0;
     FOR (i, 0, 32) {
@@ -1078,7 +1080,7 @@ int p_from_eddsa()
     return status;
 }
 
-int p_from_ed25519()
+static int p_from_ed25519()
 {
     int status = 0;
     FOR (i, 0, 32) {
@@ -1093,10 +1095,34 @@ int p_from_ed25519()
     return status;
 }
 
-#define TEST(name, nb_inputs) vector_test(name, #name, nb_inputs, \
-                                          nb_##name##_vectors,    \
-                                          name##_vectors,         \
-                                          name##_sizes)
+#define TEST(name, nb_inputs)                      \
+    int v_##name() {                               \
+        return vector_test(name, #name, nb_inputs, \
+                           nb_##name##_vectors,    \
+                           name##_vectors,         \
+                           name##_sizes);          \
+    }
+
+TEST(chacha20      , 4)
+TEST(ietf_chacha20 , 4)
+TEST(hchacha20     , 2)
+TEST(xchacha20     , 4)
+TEST(poly1305      , 2)
+TEST(aead_ietf     , 4)
+TEST(blake2b       , 2)
+TEST(sha512        , 1)
+TEST(hmac_sha512   , 2)
+TEST(argon2i       , 6)
+TEST(x25519        , 2)
+TEST(x25519_pk     , 1)
+TEST(key_exchange  , 2)
+TEST(edDSA         , 3)
+TEST(edDSA_pk      , 1)
+TEST(ed_25519      , 3)
+TEST(ed_25519_pk   , 1)
+TEST(ed_25519_check, 3)
+TEST(elligator_dir , 1)
+TEST(elligator_inv , 3)
 
 int main(int argc, char *argv[])
 {
@@ -1108,27 +1134,27 @@ int main(int argc, char *argv[])
     int status = 0;
     printf("\nTest against vectors");
     printf("\n--------------------\n");
-    status |= TEST(chacha20      , 4);
-    status |= TEST(ietf_chacha20 , 4);
-    status |= TEST(hchacha20     , 2);
-    status |= TEST(xchacha20     , 4);
-    status |= TEST(poly1305      , 2);
-    status |= TEST(aead_ietf     , 4);
-    status |= TEST(blake2b       , 2);
-    status |= TEST(sha512        , 1);
-    status |= TEST(hmac_sha512   , 2);
-    status |= TEST(argon2i       , 6);
-    status |= TEST(x25519        , 2);
-    status |= TEST(x25519_pk     , 1);
-    status |= TEST(key_exchange  , 2);
-    status |= TEST(edDSA         , 3);
-    status |= TEST(edDSA_pk      , 1);
-    status |= TEST(ed_25519      , 3);
-    status |= TEST(ed_25519_pk   , 1);
-    status |= TEST(ed_25519_check, 3);
+    status |= v_chacha20      ();
+    status |= v_ietf_chacha20 ();
+    status |= v_hchacha20     ();
+    status |= v_xchacha20     ();
+    status |= v_poly1305      ();
+    status |= v_aead_ietf     ();
+    status |= v_blake2b       ();
+    status |= v_sha512        ();
+    status |= v_hmac_sha512   ();
+    status |= v_argon2i       ();
+    status |= v_x25519        ();
+    status |= v_x25519_pk     ();
+    status |= v_key_exchange  ();
+    status |= v_edDSA         ();
+    status |= v_edDSA_pk      ();
+    status |= v_ed_25519      ();
+    status |= v_ed_25519_pk   ();
+    status |= v_ed_25519_check();
+    status |= v_elligator_dir ();
+    status |= v_elligator_inv ();
     status |= test_x25519();
-    status |= TEST(elligator_dir , 1);
-    status |= TEST(elligator_inv , 3);
 
     printf("\nProperty based tests");
     printf("\n--------------------\n");
